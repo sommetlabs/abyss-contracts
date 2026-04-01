@@ -62,17 +62,17 @@ Contracts implementing this standard MUST add the following ledger variables:
 
 ```typescript
 export ledger domain: Bytes<32>;
-export ledger color: Bytes<32>;
 export ledger utxoSupply: Uint<128>;
 ledger mintCounter: Counter;
 ledger mintNonce: Bytes<32>;
 ```
 
-- `domain`: A domain separator set at construction, used to compute the [token color](https://docs.midnight.network/concepts/utxo) for unshielded UTXOs. MUST be public (`export ledger`) so that any participant can read it and so that the conversion circuits can access it directly from ledger state.
-- `color`: The token color, computed once in the constructor as `tokenType(domain, kernel.self())`. MUST be public (`export ledger`). Used by `unshield` for color validation and by `fromUtxo` for token identification. Computing once avoids redundant hash computation in every conversion circuit.
+- `domain`: A domain separator set at construction, used to compute the [token color](https://docs.midnight.network/concepts/utxo) for UTXO operations. MUST be public (`export ledger`) so that any participant can read it and so that the conversion circuits can derive the token color at call time via `tokenType(domain, kernel.self())`.
 - `utxoSupply`: A running total of tokens currently held as UTXOs (both shielded and unshielded). Incremented by `shield` and `toUtxo`, decremented by `unshield` and `fromUtxo`. MUST be public (`export ledger`) for off-chain supply accounting.
 - `mintCounter`: A monotonically increasing counter used together with `mintNonce` to guarantee uniqueness of shielded coin commitments. SHOULD be private (`ledger`, not `export ledger`) to reduce information leakage.
 - `mintNonce`: A nonce that evolves with each `shield` operation to prevent commitment collisions. SHOULD be private (`ledger`, not `export ledger`) to reduce information leakage.
+
+**Why not store `color` in the ledger?** An earlier version stored the token color as `export ledger color: Bytes<32>`, precomputed in the constructor via `tokenType(domainSep, kernel.self())`. This was found to produce a different hash than what `mintShieldedToken` and `mintUnshieldedToken` stamp on minted coins. The Compact runtime resolves `kernel.self()` differently during constructor execution vs circuit execution, causing a mismatch that breaks `unshield` color validation and `fromUtxo` UTXO absorption. The fix is to compute `tokenType(domain, kernel.self())` at call time in each circuit that needs it.
 
 These MUST be initialized in the constructor:
 
@@ -80,9 +80,7 @@ These MUST be initialized in the constructor:
 constructor(..., domainSep: Bytes<32>, initNonce: Bytes<32>) {
     // ... existing FungibleToken initialization ...
     domain = disclose(domainSep);
-    color = disclose(tokenType(disclose(domainSep), kernel.self()));
     mintNonce = disclose(initNonce);
-    utxoSupply = 0 as Uint<128>;
 }
 ```
 
@@ -126,8 +124,9 @@ Converts a [shielded UTXO](https://docs.midnight.network/concepts/zswap) back in
 **Behavior:**
 
 1. MUST revert if `coin.value` is zero.
-2. MUST revert if `coin.color` does not equal the stored `color` ledger variable. This prevents crediting this token's Map balance with a shielded coin from a different token contract.
-3. Call `receiveShielded(coin)` from the [Compact Standard Library](https://docs.midnight.network/compact) to absorb (nullify) the shielded coin from the transaction.
+2. Compute the expected token color as `tokenType(domain, kernel.self())`.
+3. MUST revert if `coin.color` does not equal the computed color. This prevents crediting this token's Map balance with a shielded coin from a different token contract.
+4. Call `receiveShielded(coin)` from the [Compact Standard Library](https://docs.midnight.network/compact) to absorb (nullify) the shielded coin from the transaction.
 4. Credit `coin.value` to the caller's Map balance. MUST revert on arithmetic overflow.
 5. Decrement `utxoSupply` by `coin.value`.
 6. MUST NOT modify `totalSupply`.
@@ -143,7 +142,7 @@ Converts [unshielded UTXOs](https://docs.midnight.network/concepts/utxo) back in
 **Behavior:**
 
 1. MUST revert if `amount` is zero.
-2. Read the token color from the stored `color` ledger variable (precomputed in the constructor as `tokenType(domain, kernel.self())`).
+2. Compute the token color as `tokenType(domain, kernel.self())`.
 3. Call `receiveUnshielded(color, amount)` to absorb (nullify) the unshielded UTXOs from the transaction.
 4. Credit `amount` to the caller's Map balance. MUST revert on arithmetic overflow.
 5. Decrement `utxoSupply` by `amount`.
