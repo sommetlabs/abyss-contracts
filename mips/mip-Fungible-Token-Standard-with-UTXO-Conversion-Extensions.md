@@ -1,5 +1,5 @@
 ---
-MIP: ?
+MIP: "?"
 Title: Fungible Token Standard with UTXO Conversion Extensions
 Authors:
   - Guido De Vita (dvgui)
