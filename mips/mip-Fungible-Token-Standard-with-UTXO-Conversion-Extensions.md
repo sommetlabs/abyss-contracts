@@ -278,6 +278,78 @@ Without an on-chain `utxoSupply` counter, there is no way for the contract (or o
 - Review and endorsement by the Midnight developer community through workshop sessions (as described in [MIP-1](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0001-Midnight-Improvement-Proposal-Process.md)).
 - Security audit of a reference implementation.
 
+### Reference Deployment (Preprod)
+
+A reference implementation has been deployed on Midnight preprod and exercised through all conversion circuits. The deployment demonstrates the full token lifecycle: minting, Map → UTXO conversion (both shielded and unshielded), and UTXO → Map round-trip.
+
+**Contract:** [`ef0ba484ee62fd8e31a7f84732d3b2934b3dcf441c6619b9ba503d8d113a7161`](https://preprod.nightscan.io/contract/?addr=ef0ba484ee62fd8e31a7f84732d3b2934b3dcf441c6619b9ba503d8d113a7161)
+**Network:** preprod | **Token:** MIP42 | **Decimals:** 6
+**Token color:** `532a67c05b9e3c890f6fe93df3c03644efa708a31a2ae2458d975130651345cf`
+
+| # | Circuit | Amount (MIP42) | Transaction |
+|---|---------|----------------|-------------|
+| 1 | `deploy` (constructor) | — | [`ef0ba484...3a7161`](https://preprod.nightscan.io/contract/?addr=ef0ba484ee62fd8e31a7f84732d3b2934b3dcf441c6619b9ba503d8d113a7161) |
+| 2 | `mint` | 1,000.000000 | [`0060e08d...9f871d`](https://preprod.nightscan.io/tx/?hash=0060e08de2b5adaaee55c3d888a4e8a64b8678b312f1470f692c01a254bb9f871d) |
+| 3 | `toUtxo` | 100.000000 | [`0032c6a8...62d0a5`](https://preprod.nightscan.io/tx/?hash=0032c6a87aaedc6e59800d1c3c95486d3f238f246661af46ccfd03875e1662d0a5) |
+| 4 | `toUtxo` | 50.000000 | [`00ecb30d...197161`](https://preprod.nightscan.io/tx/?hash=00ecb30d9334b4fb687439de304e5b324b28c9739c5523a5ed2ac48ce915197161) |
+| 5 | `shield` | 100.000000 | [`0036b317...b5952a`](https://preprod.nightscan.io/tx/?hash=0036b31799aba1830775b0711fe0179dfb62e4979255285f9d83f7eb0d28b5952a) |
+| 6 | `shield` | 50.000000 | [`00207542...bce396`](https://preprod.nightscan.io/tx/?hash=00207542360e240826d9b7efc3cb27ba08eeae5da91e4a7749b3a9d05014bce396) |
+| 7 | `fromUtxo` | 100.000000 | [`00b1bc05...27e4a9`](https://preprod.nightscan.io/tx/?hash=00b1bc05cfc046c7dfb4517518f099f2830616094f48bf6ba7f029ee0d5a27e4a9) |
+| 8 | `unshield` | 100.000000 | [`00f10b70...16bed3`](https://preprod.nightscan.io/tx/?hash=00f10b70be48f23541265baf2aada707a81952d5df2965580c71e73ac81116bed3) |
+
+**Final state:** 800.000000 MIP42 in Map, 50.000000 in unshielded UTXOs, 50.000000 in shielded UTXOs. `totalSupply` = 1,000.000000, `utxoSupply` = 100.000000.
+
+All four conversion circuits (`shield`, `toUtxo`, `unshield`, `fromUtxo`) demonstrated bidirectional round-trips on a live network.
+
+### ZSwap Atomic Swap Demonstration (Preprod)
+
+Two tokens deployed on preprod were used to demonstrate ZSwap atomic swaps in both unshielded and shielded modes between two independent wallets (Alice and Bob).
+
+**Contracts:**
+- MIP42: [`ef0ba484...3a7161`](https://preprod.nightscan.io/contract/?addr=ef0ba484ee62fd8e31a7f84732d3b2934b3dcf441c6619b9ba503d8d113a7161)
+- SWAP: [`e92d621f...bbf94`](https://preprod.nightscan.io/contract/?addr=e92d621fbdde115ef91c5289a83ab66accabb5f411942e1edb5f2b30748bbf94)
+
+**Setup:** 500 MIP42 minted to Alice, 500 SWAP minted to Bob. Each converted 100 to unshielded UTXOs and 100 to shielded UTXOs.
+
+| # | Step | Transaction |
+|---|------|-------------|
+| 1 | Mint 500 MIP42 → Alice | [`00af800b...52e098`](https://preprod.nightscan.io/tx/?hash=00af800b5ca1ca4b6a42c2db500cc3894c0eb4d8d6fda6874fcb38d8ad4852e098) |
+| 2 | Mint 500 SWAP → Bob | [`00e2d84d...10e43b`](https://preprod.nightscan.io/tx/?hash=00e2d84d764861b14ce234be980225d6b8b8232f5a15d57c69dd796943f510e43b) |
+| 3 | Alice `toUtxo` 100 MIP42 | [`0025c0f1...3bc901`](https://preprod.nightscan.io/tx/?hash=0025c0f16feda5a4c6ad52bac76bad2a31b55f096e232298b9c7d12571403bc901) |
+| 4 | Alice `shield` 100 MIP42 | [`0024419b...8a70dd`](https://preprod.nightscan.io/tx/?hash=0024419b86464f0c7b2ec097b86ec105f52c13468cc2b6ea6f88567004b28a70dd) |
+| 5 | Bob `toUtxo` 100 SWAP | [`00ad0b30...20910`](https://preprod.nightscan.io/tx/?hash=00ad0b303418f177433590292019ee311fd2892953645ff141b5a43338a1020910) |
+| 6 | Bob `shield` 100 SWAP | [`0033325d...8e8428`](https://preprod.nightscan.io/tx/?hash=0033325d5a353cb2dec6cd306e1b62561743dc741b4ac6146987520f558d8e8428) |
+
+**Unshielded ZSwap** — Alice offers 50 MIP42 for 50 SWAP (unshielded UTXOs):
+
+| # | Step | Transaction |
+|---|------|-------------|
+| 7 | Atomic swap (unshielded) | [`00a8ec41...fae939`](https://preprod.nightscan.io/tx/?hash=00a8ec4169f2a395fd3d38559da1dfceea1b2077bb2caa67cd9469486aadfae939) |
+
+| Wallet | MIP42 unshielded | SWAP unshielded |
+|--------|-----------------|-----------------|
+| Alice (before) | 100.000000 | 0 |
+| Alice (after) | 50.000000 | 50.000000 |
+| Bob (before) | 0 | 100.000000 |
+| Bob (after) | 50.000000 | 50.000000 |
+
+**Shielded ZSwap** — Alice offers 50 MIP42 for 50 SWAP (shielded UTXOs):
+
+| # | Step | Transaction |
+|---|------|-------------|
+| 8 | Atomic swap (shielded) | [`00fd036f...67ce4d`](https://preprod.nightscan.io/tx/?hash=00fd036f16394ddb21d57312229041ff29d27b85d1c79e56cbea1cfca1ca67ce4d) |
+
+| Wallet | MIP42 shielded | SWAP shielded |
+|--------|---------------|---------------|
+| Alice (before) | 100.000000 | 0 |
+| Alice (after) | 50.000000 | 50.000000 |
+| Bob (before) | 0 | 100.000000 |
+| Bob (after) | 50.000000 | 50.000000 |
+
+Both unshielded and shielded ZSwap atomic swaps completed successfully with correct balance accounting on both sides. The shielded swap preserves privacy: the transaction on-chain does not reveal which tokens were exchanged, the amounts, or the parties involved.
+
+Full reference implementation and CLI tooling available at [midnight-swap](https://github.com/sommetlabs/midnight-swap).
+
 ### Implementation Plan
 
 1. Publish a reference implementation as an extension of the [OpenZeppelin Compact Contracts](https://github.com/OpenZeppelin/compact-contracts) `FungibleToken` library.
