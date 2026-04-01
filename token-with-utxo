@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MIT
+// Fungible Token — OZ FungibleToken with admin minting + bidirectional UTXO conversion.
+//
+// Wraps OpenZeppelin's FungibleToken (Map-based accounting) and adds:
+// - admin-only minting (Map balance)
+// - shield(): converts Map balance → shielded UTXOs (ZSwap coins)
+// - toUtxo(): converts Map balance → unshielded UTXOs (Schnorr-signed)
+// - unshield(): converts shielded UTXOs → Map balance
+// - fromUtxo(): converts unshielded UTXOs → Map balance
+//
+// Converting to/from UTXOs does NOT affect totalSupply — tokens still exist,
+// just in a different form. totalSupply tracks "total tokens ever minted".
+//
+// Flow:  admin mint() → user shield()/toUtxo() ↔ unshield()/fromUtxo()
+
+pragma language_version >= 0.22.0;
+
+import CompactStandardLibrary;
+import "./oz/compact-contracts/src/token/FungibleToken" prefix FT_;
+import "./oz/compact-contracts/src/utils/Utils" prefix Utils_;
+
+// ── Admin ──────────────────────────────────────────────────────
+
+export ledger admin: ZswapCoinPublicKey;
+export ledger minter: ZswapCoinPublicKey;
+
+// ── UTXO minting state ─────────────────────────────────────────
+
+export ledger domain: Bytes<32>;
+export ledger color: Bytes<32>;
+export ledger utxoSupply: Uint<128>;
+ledger mintCounter: Counter;
+ledger mintNonce: Bytes<32>;
+
+// ── Constructor ────────────────────────────────────────────────
+
+constructor(
+  tokenName: Opaque<"string">,
+  tokenSymbol: Opaque<"string">,
+  tokenDecimals: Uint<8>,
+  domainSep: Bytes<32>,
+  initNonce: Bytes<32>
+) {
+  FT_initialize(tokenName, tokenSymbol, tokenDecimals);
+  admin = ownPublicKey();
+  minter = ownPublicKey();
+  domain = disclose(domainSep);
+  color = disclose(tokenType(disclose(domainSep), kernel.self()));
+  mintNonce = disclose(initNonce);
+}
+
+// ── Internal helpers ──────────────────────────────────────────
+
+circuit assertAdmin(): [] {
+  assert(ownPublicKey() == admin, "only admin");
+}
+
+circuit assertMinter(): [] {
+  assert(ownPublicKey() == minter, "only minter");
+}
+
+// Deduct from Map balance WITHOUT decreasing totalSupply.
+// Used when converting Map → UTXOs (tokens still exist in UTXO form).
+circuit _deductBalance(
+  account: Either<ZswapCoinPublicKey, ContractAddress>,
+  amount: Uint<128>
+): [] {
+  const bal = FT_balanceOf(account);
+  assert(bal >= amount, "insufficient balance");
+  FT__balances.insert(disclose(account), disclose(bal - amount as Uint<128>));
+}
+
+// Credit Map balance WITHOUT increasing totalSupply.
+// Used when converting UTXOs → Map (tokens return from UTXO form).
+circuit _creditBalance(
+  account: Either<ZswapCoinPublicKey, ContractAddress>,
+  amount: Uint<128>
+): [] {
+  const bal = FT_balanceOf(account);
+  const MAX_UINT128 = 340282366920938463463374607431768211455;
+  assert(MAX_UINT128 - bal >= amount, "arithmetic overflow");
+  FT__balances.insert(disclose(account), disclose(bal + amount as Uint<128>));
+}
+
+// ── FungibleToken public API (re-exported) ────────────────────
+
+export circuit name(): Opaque<"string"> {
+  return FT_name();
+}
+
+export circuit symbol(): Opaque<"string"> {
+  return FT_symbol();
+}
+
+export circuit decimals(): Uint<8> {
+  return FT_decimals();
+}
+
+export circuit totalSupply(): Uint<128> {
+  return FT_totalSupply();
+}
+
+export circuit balanceOf(
+  account: Either<ZswapCoinPublicKey, ContractAddress>
+): Uint<128> {
+  return FT_balanceOf(account);
+}
+
+export circuit transfer(
+  to: Either<ZswapCoinPublicKey, ContractAddress>,
+  value: Uint<128>
+): Boolean {
+  return FT_transfer(to, value);
+}
+
+// NOTE: approve, allowance, transferFrom deferred — C2C calls disabled on Midnight.
+// These circuits are only useful when a contract can spend on behalf of a user.
+
+// ── Shield: convert Map balance → shielded UTXOs ─────────────
+//
+// Any user can call this to convert their own FungibleToken (Map)
+// balance into protocol-level shielded coins.  Deducts from the
+// caller's Map balance (without touching totalSupply) and mints
+// a ZSwap coin to the caller.
+
+export circuit shield(amount: Uint<64>): ShieldedCoinInfo {
+  assert(disclose(amount) > 0, "amount must be positive");
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+
+  // Deduct from caller's Map balance (totalSupply unchanged)
+  _deductBalance(caller, amount);
+  utxoSupply = disclose(utxoSupply + amount as Uint<128>);
+
+  // Evolve nonce for uniqueness
+  mintCounter.increment(1);
+  mintNonce = evolveNonce(mintCounter, mintNonce);
+
+  // Mint shielded coin to the caller
+  return mintShieldedToken(domain, disclose(amount), mintNonce, caller);
+}
+
+// ── toUtxo: convert Map balance → unshielded UTXOs ───────────
+//
+// Any user can call this to convert their own FungibleToken (Map)
+// balance into protocol-level unshielded UTXOs (Schnorr-signed).
+// Deducts from the caller's Map balance (without touching
+// totalSupply) and mints an unshielded token to the recipient.
+// The token color is deterministic: SHA-256(contractAddress, domain)
+
+export circuit toUtxo(
+  amount: Uint<64>,
+  recipient: UserAddress
+): Bytes<32> {
+  assert(disclose(amount) > 0, "amount must be positive");
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+
+  // Deduct from caller's Map balance (totalSupply unchanged)
+  // Uint<64> → Uint<128> widening is free (subtype)
+  _deductBalance(caller, amount);
+  utxoSupply = disclose(utxoSupply + amount as Uint<128>);
+
+  // Mint unshielded UTXO to recipient — returns the token color
+  return mintUnshieldedToken(
+    domain,
+    disclose(amount),
+    right<ContractAddress, UserAddress>(disclose(recipient))
+  );
+}
+
+// ── fromUtxo: convert unshielded UTXOs → Map balance ─────────
+//
+// Any user can call this to convert their unshielded UTXOs back
+// into Map balance. The protocol absorbs (nullifies) the UTXOs
+// and the contract credits the caller's Map balance.
+
+export circuit fromUtxo(amount: Uint<128>): [] {
+  assert(disclose(amount) > 0, "amount must be positive");
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+
+  // Absorb unshielded UTXOs matching this token's color
+  receiveUnshielded(color, disclose(amount));
+
+  // Credit caller's Map balance (totalSupply unchanged)
+  _creditBalance(caller, amount);
+  utxoSupply = disclose(utxoSupply - amount as Uint<128>);
+}
+
+// ── Unshield: convert shielded UTXOs → Map balance ───────────
+//
+// Any user can call this to convert their shielded coins back
+// into Map balance. The protocol absorbs the shielded coin and
+// the contract credits the caller's Map balance.
+
+export circuit unshield(coin: ShieldedCoinInfo): [] {
+  assert(disclose(coin.value) > 0, "amount must be positive");
+  assert(disclose(coin.color == color), "wrong token color");
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+
+  // Absorb the shielded coin from the transaction
+  receiveShielded(disclose(coin));
+
+  // Credit caller's Map balance (totalSupply unchanged)
+  _creditBalance(caller, coin.value);
+  utxoSupply = disclose(utxoSupply - coin.value as Uint<128>);
+}
+
+// ── Minting (requires minter key) ───────────────────────────
+
+export circuit mint(
+  account: Either<ZswapCoinPublicKey, ContractAddress>,
+  value: Uint<128>
+): [] {
+  assertMinter();
+  FT__mint(account, value);
+}
+
+// Admin can delegate minting to another key
+export circuit setMinter(newMinter: ZswapCoinPublicKey): [] {
+  assertAdmin();
+  minter = disclose(newMinter);
+}
+
+// ── Burn: destroy tokens from caller's Map balance ───────────
+//
+// Any user can burn their own tokens. Reduces both the caller's
+// Map balance and totalSupply. Useful for bridges and redemptions.
+
+export circuit burn(value: Uint<128>): [] {
+  assert(disclose(value) > 0, "amount must be positive");
+  const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+  FT__burn(caller, value);
+}
