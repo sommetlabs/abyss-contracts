@@ -19,15 +19,31 @@ import CompactStandardLibrary;
 import "./oz/compact-contracts/src/token/FungibleToken" prefix FT_;
 import "./oz/compact-contracts/src/utils/Utils" prefix Utils_;
 
-// ── Admin ──────────────────────────────────────────────────────
+// ── Admin / Minter (hash-based authentication) ────────────────
+//
+// SECURITY: `ownPublicKey()` is a witness function — its return value is
+// supplied by the user's frontend and is NOT bound to the ZK proof. A
+// malicious frontend can return any key, so storing role identities as
+// `ZswapCoinPublicKey` and checking `ownPublicKey() == storedRole` is
+// bypassable. The Midnight security docs forbid this pattern.
+//
+// Instead, roles are stored as dApp-scoped commitments `H(domain, sk)`.
+// To exercise a role, the caller must produce a `sk` whose commitment
+// matches the stored one — and that match is verified INSIDE the ZK
+// circuit, so it cannot be spoofed by the frontend.
+//
+// `secretKey()` is still a witness (it lives in the caller's private
+// state), but it is never compared directly: it is hashed in-circuit
+// with a domain separator, and only the hash equality is asserted.
 
-export ledger admin: ZswapCoinPublicKey;
-export ledger minter: ZswapCoinPublicKey;
+witness secretKey(): Bytes<32>;
+
+export ledger admin: Bytes<32>;
+export ledger minter: Bytes<32>;
 
 // ── UTXO minting state ─────────────────────────────────────────
 
 export ledger domain: Bytes<32>;
-export ledger color: Bytes<32>;
 export ledger utxoSupply: Uint<128>;
 ledger mintCounter: Counter;
 ledger mintNonce: Bytes<32>;
@@ -42,21 +58,30 @@ constructor(
   initNonce: Bytes<32>
 ) {
   FT_initialize(tokenName, tokenSymbol, tokenDecimals);
-  admin = ownPublicKey();
-  minter = ownPublicKey();
+  const adminPk = authPublicKey(secretKey());
+  admin = disclose(adminPk);
+  minter = disclose(adminPk);
   domain = disclose(domainSep);
-  color = disclose(tokenType(disclose(domainSep), kernel.self()));
   mintNonce = disclose(initNonce);
 }
 
 // ── Internal helpers ──────────────────────────────────────────
 
+// Derive a dApp-scoped commitment from a secret key. The domain separator
+// `"midnight-swap:token:auth"` binds the commitment to this contract's auth
+// purpose so that the same `sk` cannot be replayed against other contracts.
+circuit authPublicKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>(
+    [pad(32, "midnight-swap:token:auth"), sk]
+  );
+}
+
 circuit assertAdmin(): [] {
-  assert(ownPublicKey() == admin, "only admin");
+  assert(admin == authPublicKey(secretKey()), "only admin");
 }
 
 circuit assertMinter(): [] {
-  assert(ownPublicKey() == minter, "only minter");
+  assert(minter == authPublicKey(secretKey()), "only minter");
 }
 
 // Deduct from Map balance WITHOUT decreasing totalSupply.
@@ -177,7 +202,8 @@ export circuit fromUtxo(amount: Uint<128>): [] {
   assert(disclose(amount) > 0, "amount must be positive");
   const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
 
-  // Absorb unshielded UTXOs matching this token's color
+  // Compute the token color and absorb unshielded UTXOs
+  const color = tokenType(domain, kernel.self());
   receiveUnshielded(color, disclose(amount));
 
   // Credit caller's Map balance (totalSupply unchanged)
@@ -193,7 +219,8 @@ export circuit fromUtxo(amount: Uint<128>): [] {
 
 export circuit unshield(coin: ShieldedCoinInfo): [] {
   assert(disclose(coin.value) > 0, "amount must be positive");
-  assert(disclose(coin.color == color), "wrong token color");
+  const expectedColor = tokenType(domain, kernel.self());
+  assert(disclose(coin.color == expectedColor), "wrong token color");
   const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
 
   // Absorb the shielded coin from the transaction
@@ -214,10 +241,12 @@ export circuit mint(
   FT__mint(account, value);
 }
 
-// Admin can delegate minting to another key
-export circuit setMinter(newMinter: ZswapCoinPublicKey): [] {
+// Admin can delegate minting to another key. The new minter computes
+// `authPublicKey(theirSecretKey)` off-chain and supplies the resulting
+// commitment — the contract never sees the raw secret.
+export circuit setMinter(newMinterCommitment: Bytes<32>): [] {
   assertAdmin();
-  minter = disclose(newMinter);
+  minter = disclose(newMinterCommitment);
 }
 
 // ── Burn: destroy tokens from caller's Map balance ───────────
