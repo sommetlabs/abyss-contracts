@@ -44,6 +44,7 @@ export ledger minter: Bytes<32>;
 // ── UTXO minting state ─────────────────────────────────────────
 
 export ledger domain: Bytes<32>;
+export ledger color: Bytes<32>;
 export ledger utxoSupply: Uint<128>;
 ledger mintCounter: Counter;
 ledger mintNonce: Bytes<32>;
@@ -62,6 +63,7 @@ constructor(
   admin = disclose(adminPk);
   minter = disclose(adminPk);
   domain = disclose(domainSep);
+  color = disclose(tokenType(disclose(domainSep), kernel.self()));
   mintNonce = disclose(initNonce);
 }
 
@@ -202,8 +204,7 @@ export circuit fromUtxo(amount: Uint<128>): [] {
   assert(disclose(amount) > 0, "amount must be positive");
   const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
 
-  // Compute the token color and absorb unshielded UTXOs
-  const color = tokenType(domain, kernel.self());
+  // Absorb unshielded UTXOs matching this token's color
   receiveUnshielded(color, disclose(amount));
 
   // Credit caller's Map balance (totalSupply unchanged)
@@ -219,8 +220,7 @@ export circuit fromUtxo(amount: Uint<128>): [] {
 
 export circuit unshield(coin: ShieldedCoinInfo): [] {
   assert(disclose(coin.value) > 0, "amount must be positive");
-  const expectedColor = tokenType(domain, kernel.self());
-  assert(disclose(coin.color == expectedColor), "wrong token color");
+  assert(disclose(coin.color == color), "wrong token color");
   const caller = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
 
   // Absorb the shielded coin from the transaction
