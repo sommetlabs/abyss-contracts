@@ -6,7 +6,7 @@ Authors:
 Status: Proposed
 Category: Standards
 Created: 2026-03-21
-Updated: 2026-04-01
+Updated: 2026-05-21
 Requires: MIP-1
 Replaces: none
 License: Apache-2.0
@@ -83,6 +83,36 @@ constructor(..., domainSep: Bytes<32>, initNonce: Bytes<32>) {
     mintNonce = disclose(initNonce);
 }
 ```
+
+#### Authorization State (for implementations exposing `mint`)
+
+If a `mint` circuit is provided, the implementation MUST authenticate the caller via a hash-based commitment rather than `ownPublicKey()`. The reference implementation declares:
+
+```typescript
+witness secretKey(): Bytes<32>;
+
+export ledger admin: Bytes<32>;
+export ledger minter: Bytes<32>;
+```
+
+- `secretKey()`: A witness function returning the caller's 32-byte authentication secret. The secret lives only in the caller's private state and never appears on-chain or in any disclosed circuit value.
+- `admin`: A `Bytes<32>` commitment registered at construction. The deployer's `secretKey()` is hashed in-circuit and stored as the admin identity.
+- `minter`: A `Bytes<32>` commitment initially identical to `admin`. Can be reassigned via `setMinter` to delegate minting authority.
+
+Initialization in the constructor uses the hash-based pattern:
+
+```typescript
+constructor(..., domainSep: Bytes<32>, initNonce: Bytes<32>) {
+    // ... existing FungibleToken initialization ...
+    const adminPk = authPublicKey(secretKey());
+    admin = disclose(adminPk);
+    minter = disclose(adminPk);
+    domain = disclose(domainSep);
+    mintNonce = disclose(initNonce);
+}
+```
+
+See [Hash-Based Authentication](#hash-based-authentication-for-admin-and-minter) below for the `authPublicKey` helper and its security rationale.
 
 ### Required Circuits
 
@@ -168,13 +198,15 @@ Implementations MAY include a `burn` circuit that allows any user to burn their 
 
 Implementations MAY include a `mint` circuit for post-deployment token issuance. Alternatively, the entire supply may be minted in the constructor.
 
-If a `mint` circuit is provided, it SHOULD be gated by an access control mechanism. The reference implementation uses a lightweight `admin`/`minter` key pattern: the deployer is both `admin` and `minter` by default, and the admin can delegate minting via `setMinter(newMinter: ZswapCoinPublicKey)`. Implementations are free to choose any suitable authorization scheme.
+If a `mint` circuit is provided, it MUST be gated by an access control mechanism. The reference implementation uses a hash-based `admin`/`minter` pattern: roles are stored as `Bytes<32>` commitments derived from the role-holder's secret, and `mint` / `setMinter` callers prove they hold the matching secret inside the ZK circuit. The deployer is both `admin` and `minter` by default; the admin can delegate minting via `setMinter(newMinterCommitment: Bytes<32>)`. Implementations are free to choose any suitable authorization scheme, **but MUST NOT use `ownPublicKey()` for caller verification** — see [Hash-Based Authentication](#hash-based-authentication-for-admin-and-minter).
 
 ### Optional: Minting Delegation
 
-#### `setMinter(newMinter: ZswapCoinPublicKey) → []`
+#### `setMinter(newMinterCommitment: Bytes<32>) → []`
 
 Admin-only circuit that delegates minting authority to a different key. The deployer starts as both `admin` and `minter`. Calling `setMinter` changes who can call `mint` without transferring admin control.
+
+The new minter computes their commitment off-chain as `authPublicKey(theirSecret)` (see [Hash-Based Authentication](#hash-based-authentication-for-admin-and-minter)) and supplies the resulting `Bytes<32>` value. The contract never sees the raw secret — it only stores the commitment and verifies future `mint` callers against it in-circuit.
 
 ### Supply Invariant
 
@@ -383,11 +415,50 @@ Each `shield` or `toUtxo` call creates a new [UTXO](https://docs.midnight.networ
 
 The `domain` value is set once at construction and stored as public ledger state. The `toUtxo` and `fromUtxo` circuits read `domain` directly from the ledger, ensuring that all unshielded UTXO operations use the correct and consistent token color. Since `domain` is immutable after construction (there is no circuit to modify it), the token color for a given contract is fixed for its lifetime. Users and wallets do not need to know or manage the domain separator — it is always read from the contract's public state.
 
-### Role-Based Access Control
+### Hash-Based Authentication for `admin` and `minter`
 
-For implementations that include a `mint` circuit, access control is critical to prevent unauthorized supply inflation. A single admin key controlling minting authority is a centralization risk: if the key is compromised, an attacker gains unlimited minting power; if the key is lost, no new tokens can ever be minted.
+For implementations that include a `mint` circuit, access control is critical to prevent unauthorized supply inflation.
 
-The reference implementation uses a lightweight `admin`/`minter` key pattern with `setMinter` delegation. This keeps the circuit count low (critical for Midnight's current block limits), but provides only single-key authorization. Production deployments with higher block limits SHOULD adopt the [OpenZeppelin AccessControl](https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/access/AccessControl.compact) module or an equivalent mechanism for role separation, multi-party governance, revocability, and auditability.
+**`ownPublicKey()` MUST NOT be used to verify the caller.** It is a witness function: its return value is supplied by the user's frontend and is not bound to the ZK proof. A malicious dApp can return any value, so a check like `assert(ownPublicKey() == admin, ...)` is bypassable. The [Midnight smart-contract security docs](https://docs.midnight.network/) explicitly forbid this pattern. Storing role identities as `ZswapCoinPublicKey` and comparing them against `ownPublicKey()` was the original approach in earlier versions of this MIP, and it is now considered insecure.
+
+Instead, roles MUST be stored as **dApp-scoped commitments** of the role-holder's secret. The caller proves in-circuit that they know a secret whose hash matches the stored commitment. Because the hash is recomputed inside the proof from a witness value, the frontend cannot substitute a different identity without inverting the hash.
+
+The reference implementation uses the following helper:
+
+```typescript
+witness secretKey(): Bytes<32>;
+
+circuit authPublicKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>(
+    [pad(32, "midnight-swap:token:auth"), sk]
+  );
+}
+
+circuit assertAdmin(): [] {
+  assert(admin == authPublicKey(secretKey()), "only admin");
+}
+
+circuit assertMinter(): [] {
+  assert(minter == authPublicKey(secretKey()), "only minter");
+}
+```
+
+- The domain separator (`"midnight-swap:token:auth"` in the reference; implementers SHOULD choose their own) prevents a secret from being replayed across unrelated dApps.
+- `authPublicKey` MUST hash a fixed 32-byte domain separator together with the secret. The first argument padding ensures different domains produce different commitments even when the secret is the same.
+- `assertAdmin` and `assertMinter` MUST be the only gates on `setMinter` and `mint` respectively.
+
+**Initialization.** The constructor sets `admin` and `minter` to `disclose(authPublicKey(secretKey()))`. The deployer's secret is the deployer's only credential; losing it makes the contract immutably minterless.
+
+**Delegation.** `setMinter(newMinterCommitment: Bytes<32>)` accepts a pre-computed commitment from the new minter. Operationally:
+
+1. The new minter generates or chooses their own 32-byte secret locally.
+2. They compute `authPublicKey(theirSecret)` off-chain using the same hash and domain separator.
+3. They share only the resulting `Bytes<32>` commitment with the admin.
+4. The admin calls `setMinter(thatCommitment)`. The raw secret never leaves the new minter's machine.
+
+**Single-key authorization.** The reference pattern still authorizes a single key per role. Production deployments that need role separation, multi-party governance, or revocation SHOULD layer a richer scheme on top (e.g. a Merkle tree of authorized commitments + nullifiers). The Midnight devnet's 15-verifier ceiling currently prevents [OpenZeppelin AccessControl](https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/access/AccessControl.compact) from being used directly with this token; OZ AccessControl itself currently authenticates via `ownPublicKey()` and SHOULD NOT be used until it migrates to the same hash-based pattern.
+
+**Residual risk.** Secret leakage equals identity loss: anyone with the role-holder's `secretKey()` value can impersonate them. Treat the secret the same way as a wallet signing key. Deriving the secret from a wallet seed (as the reference implementation does) ties on-chain identities to the same threat model as the wallet itself.
 
 ### Zero-Amount Protection
 
@@ -411,7 +482,7 @@ All conversion circuits (`shield`, `toUtxo`, `unshield`, `fromUtxo`) MUST revert
 
 ### Reference Implementation
 
-A reference implementation is provided as a [Compact](https://docs.midnight.network/compact) contract that imports and wraps the [FungibleToken](https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/token/FungibleToken.compact) module. The reference implementation includes optional `burn`, `mint` (gated by `admin`/`minter` key pattern with `setMinter` delegation), and 13 circuits total (15 verifier keys — at the local devnet block limit). The full source will be available at: [link to be provided upon submission].
+A reference implementation is provided as a [Compact](https://docs.midnight.network/compact) contract that imports and wraps the [FungibleToken](https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/token/FungibleToken.compact) module. The reference implementation includes optional `burn`, `mint` (gated by the hash-based `admin`/`minter` pattern with `setMinter` delegation), and 13 circuits total (15 verifier keys — at the local devnet block limit). The full source is available in this repository at [`token-with-utxo`](../token-with-utxo) and the full development tooling at [midnight-swap](https://github.com/sommetlabs/midnight-swap).
 
 ## Testing
 
@@ -424,6 +495,8 @@ A reference implementation is provided as a [Compact](https://docs.midnight.netw
 - Revert on insufficient balance for `shield` and `toUtxo`.
 - Revert on zero amount for all conversion circuits.
 - Revert on overflow for `_creditBalance`.
+- `mint`: revert when the caller's `secretKey()` does not hash to the stored `minter` commitment. Pass when it does.
+- `setMinter`: revert when the caller is not the admin (`secretKey()` does not hash to `admin`). After a successful delegation, the previous admin's `secretKey()` no longer hashes to `minter` and can no longer `mint`.
 
 ### Integration Tests
 
@@ -449,6 +522,7 @@ A reference implementation is provided as a [Compact](https://docs.midnight.netw
 - [Midnight Ledgers Documentation](https://docs.midnight.network/concepts/ledgers)
 - [The Compact Language](https://docs.midnight.network/compact)
 - [ERC-20 Token Standard (Ethereum)](https://eips.ethereum.org/EIPS/eip-20)
+- [Midnight Smart-Contract Security: caller authentication](https://docs.midnight.network/) (forbids `ownPublicKey()` for caller verification)
 
 ## Acknowledgements
 
