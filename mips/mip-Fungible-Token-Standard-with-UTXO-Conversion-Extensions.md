@@ -6,7 +6,7 @@ Authors:
 Status: Proposed
 Category: Standards
 Created: 2026-03-21
-Updated: 2026-05-21
+Updated: 2026-05-27
 Requires: MIP-1
 Replaces: none
 License: Apache-2.0
@@ -157,13 +157,13 @@ Converts a [shielded UTXO](https://docs.midnight.network/concepts/zswap) back in
 2. Compute the expected token color as `tokenType(domain, kernel.self())`.
 3. MUST revert if `coin.color` does not equal the computed color. This prevents crediting this token's Map balance with a shielded coin from a different token contract.
 4. Call `receiveShielded(coin)` from the [Compact Standard Library](https://docs.midnight.network/compact) to absorb (nullify) the shielded coin from the transaction.
-4. Credit `coin.value` to the caller's Map balance. MUST revert on arithmetic overflow.
-5. Decrement `utxoSupply` by `coin.value`.
-6. MUST NOT modify `totalSupply`.
+5. Credit `coin.value` to the caller's Map balance. MUST revert on arithmetic overflow.
+6. Decrement `utxoSupply` by `coin.value`.
+7. MUST NOT modify `totalSupply`.
 
 **Design note:** The amount to credit is derived directly from `coin.value` (which is `Uint<128>`) rather than accepted as a separate parameter. Since `ShieldedCoinInfo.value` is the committed value of the shielded coin, this eliminates any possibility of an amount mismatch between the UTXO value and the Map balance credit.
 
-**Security note:** The color validation in step 2 is critical. Without it, a user could call `unshield` with a shielded coin from a different token contract and receive a Map balance credit for this token. The `receiveShielded` call itself does not validate the coin's color — it only verifies the coin exists in the ZSwap Merkle tree.
+**Security note:** The color validation (steps 2–3) is critical. Without it, a user could call `unshield` with a shielded coin from a different token contract and receive a Map balance credit for this token. The `receiveShielded` call itself does not validate the coin's color — it only verifies the coin exists in the ZSwap Merkle tree.
 
 #### `fromUtxo(amount: Uint<128>) → []`
 
@@ -448,6 +448,23 @@ circuit assertMinter(): [] {
 - `assertAdmin` and `assertMinter` MUST be the only gates on `setMinter` and `mint` respectively.
 
 **Initialization.** The constructor sets `admin` and `minter` to `disclose(authPublicKey(secretKey()))`. The deployer's secret is the deployer's only credential; losing it makes the contract immutably minterless.
+
+**Supplying the `secretKey` witness.** `secretKey()` is a *witness*, so its value is not stored on-chain — it is read from the **caller's private state** at proving time and supplied per contract instance. In the reference TypeScript implementation the witness is wired as:
+
+```typescript
+type TokenPrivateState = { readonly secretKey: Uint8Array };  // 32 bytes
+
+const witnesses = {
+  secretKey: (ctx: { privateState: TokenPrivateState }): [TokenPrivateState, Uint8Array] =>
+    [ctx.privateState, ctx.privateState.secretKey],
+};
+```
+
+The secret is provided when the caller constructs or joins the contract, via the deploy/join `initialPrivateState` (e.g. `{ secretKey }`, derived from the wallet seed). Consequences for implementers and operators:
+
+- A caller who **deploys** the contract, or who calls a **privileged** circuit (`mint`, `setMinter`), MUST supply a private state whose `secretKey` matches the relevant commitment — the constructor and `assertAdmin`/`assertMinter` invoke the witness. Supplying an empty or wrong private state fails proof generation (the witness returns no/invalid bytes, or the in-circuit equality assertion fails).
+- A caller who only invokes the **non-privileged** conversion/transfer circuits (`shield`, `unshield`, `toUtxo`, `fromUtxo`, `transfer`, `balanceOf`) needs **no** secret in private state — those circuits never call `secretKey()`. Any wallet can run them against its own balance.
+- The witness value is consumed only by `authPublicKey` and is never `disclose()`d, so it stays in the caller's private state and never reaches the public ledger.
 
 **Delegation.** `setMinter(newMinterCommitment: Bytes<32>)` accepts a pre-computed commitment from the new minter. Operationally:
 
